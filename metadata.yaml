@@ -1,4 +1,4 @@
-name: 回复分段发送
+name: astrbot_plugin_split_reply
 desc: 把 LLM 回复按换行拆分成多条消息分段发送（非流式）。支持按换行/空行两种拆分模式，可配置发送间隔，自动过滤空行，防止重复发送。
 help: 无需指令，安装后自动生效。需要在 WebUI 中关闭「流式回复」(provider_settings.streaming_response) 以确保分段发送生效。
 version: v1.0.0
