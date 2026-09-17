@@ -86,8 +86,9 @@ star_mod.register = _register
 sys.modules["astrbot"] = astrbot
 sys.modules["astrbot.api"] = logger_mod
 sys.modules["astrbot.api.event"] = event_mod
-sys.modules["astrbot.api.message"] = types.ModuleType("astrbot.api.message")
-sys.modules["astrbot.api.message.message_event_result"] = mer_mod
+sys.modules["astrbot.core"] = types.ModuleType("astrbot.core")
+sys.modules["astrbot.core.message"] = types.ModuleType("astrbot.core.message")
+sys.modules["astrbot.core.message.message_event_result"] = mer_mod
 sys.modules["astrbot.api.star"] = star_mod
 
 PLUGIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")

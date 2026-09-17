@@ -36,7 +36,10 @@ from typing import List, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message.message_event_result import MessageChain, ResultContentType
+from astrbot.core.message.message_event_result import (
+    MessageChain,
+    ResultContentType,
+)
 from astrbot.api.star import Context, Star, register
 
 # 拆分模式常量
