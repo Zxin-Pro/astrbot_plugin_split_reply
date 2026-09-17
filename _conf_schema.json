@@ -1,0 +1,20 @@
+{
+  "split_mode": {
+    "description": "拆分模式：newline=按单个换行符拆分；blank_line=按空行拆分（保留段内换行）",
+    "type": "string",
+    "hint": "newline 或 blank_line",
+    "default": "newline"
+  },
+  "delay_seconds": {
+    "description": "每条分段消息之间的发送延迟（秒），防止触发平台风控",
+    "type": "float",
+    "hint": "建议 0.3 ~ 1.5",
+    "default": 0.5
+  },
+  "max_length": {
+    "description": "单条分段消息最大长度（字符数），超过则截断；0 表示不限制",
+    "type": "int",
+    "hint": "0 = 不限制",
+    "default": 0
+  }
+}
