@@ -36,6 +36,7 @@ from typing import List, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.message_event_result import (
     MessageChain,
     ResultContentType,
@@ -74,8 +75,8 @@ def split_text(text: str, mode: str = MODE_NEWLINE) -> List[str]:
 @register(
     "astrbot_plugin_split_reply",
     "Zxin-Pro",
-    "把 LLM 回复按换行拆分成多条消息分段发送（非流式）",
-    "1.0.0",
+    "非流式输出+换行分段发送插件（自动兼容流式配置）",
+    "1.1.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_split_reply",
 )
 class SplitReplyPlugin(Star):
@@ -108,10 +109,37 @@ class SplitReplyPlugin(Star):
         except (TypeError, ValueError):
             self.max_length = 0
 
+        # 强制非流式：流式输出（尤其默认的缓冲策略）会把多行内容合并成一条消息发出，
+        # 且内容在 on_llm_response 之前就已推送，插件无法拆分。
+        # AstrBot 支持事件级覆盖：internal agent stage 读取 event.get_extra("enable_streaming")，
+        # 非 None 时覆盖全局配置（internal.py:167），因此在消息事件入口统一置为 False。
+        self.force_non_streaming: bool = bool(
+            self.config.get("force_non_streaming", True)
+        )
+
         logger.info(
             f"[split_reply] 已加载 split_mode={self.split_mode} "
-            f"delay={self.delay_seconds}s max_length={self.max_length}"
+            f"delay={self.delay_seconds}s max_length={self.max_length} "
+            f"force_non_streaming={self.force_non_streaming}"
         )
+
+    # ------------------------------------------------------------------
+    # 流式兼容：在消息事件入口强制本条消息走非流式
+    # ------------------------------------------------------------------
+    @filter.event_message_type(EventMessageType.ALL)
+    async def force_non_streaming_listener(self, event: AstrMessageEvent):
+        """对所有消息事件标记 enable_streaming=False。
+
+        internal agent stage 在开始处理时读取该 extra 决定是否流式
+        （internal.py: `if (enable_streaming := event.get_extra("enable_streaming"))
+        is not None: streaming_response = bool(enable_streaming)`），
+        置为 False 后本条消息走非流式分支，on_llm_response 钩子即可拿到完整文本分段。
+        """
+        try:
+            if self.force_non_streaming:
+                event.set_extra("enable_streaming", False)
+        except Exception as e:
+            logger.warning(f"[split_reply] 设置非流式标记失败: {e}")
 
     # ------------------------------------------------------------------
     # 工具方法

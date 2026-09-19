@@ -33,10 +33,26 @@ class _Filter:
 
         return deco
 
+    def event_message_type(self, *a, **k):
+        def deco(fn):
+            fn._is_hook = True
+            return fn
+
+        return deco
+
+
+class EventMessageType:
+    ALL = "all"
+
 
 event_mod = types.ModuleType("astrbot.api.event")
 event_mod.filter = _Filter()
 event_mod.AstrMessageEvent = object
+
+event_filter_mod = types.ModuleType("astrbot.api.event.filter")
+event_filter_mod.EventMessageType = EventMessageType
+event_mod.__path__ = []  # 让 astrbot.api.event 成为包以便挂 filter 子模块
+sys.modules["astrbot.api.event.filter"] = event_filter_mod
 
 
 class ResultContentType:
@@ -142,6 +158,7 @@ class FakeResult:
 class FakeEvent:
     def __init__(self, streaming=False):
         self.sent = []
+        self.extras = {}
         self._result = FakeResult("streaming_result" if streaming else None)
 
     async def send(self, chain):
@@ -149,6 +166,12 @@ class FakeEvent:
 
     def get_result(self):
         return self._result
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
 
 
 class FakeConfig(dict):
@@ -352,6 +375,31 @@ check("失败前已发送的保留", ev.sent == ["a"])
 # terminate 不崩溃
 run(plugin.terminate())
 check("terminate 正常执行", True)
+
+# ------------------------------------------------------------------
+# 6. 强制非流式监听器测试
+# ------------------------------------------------------------------
+print("[6] force_non_streaming 监听器")
+
+plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
+ev = FakeEvent()
+run(plugin.force_non_streaming_listener(ev))
+check("默认开启时设置 enable_streaming=False", ev.get_extra("enable_streaming") is False)
+
+plugin = main.SplitReplyPlugin(main.Context(), {"force_non_streaming": False})
+ev = FakeEvent()
+run(plugin.force_non_streaming_listener(ev))
+check("关闭时不设置 extra", "enable_streaming" not in ev.extras)
+
+
+class BadEvent:
+    def set_extra(self, *a):
+        raise RuntimeError("boom")
+
+
+plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
+run(plugin.force_non_streaming_listener(BadEvent()))
+check("set_extra 异常不崩溃", True)
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
