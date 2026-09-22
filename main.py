@@ -47,6 +47,13 @@ from astrbot.api.star import Context, Star, register
 MODE_NEWLINE = "newline"        # 按单个换行符拆分
 MODE_BLANK_LINE = "blank_line"  # 按空行（\n\s*\n）拆分，保留段内换行
 
+# 流式策略常量
+STRATEGY_NON_STREAMING = "force_non_streaming"  # 强制非流式，拿完整文本后分段
+STRATEGY_STREAMING = "streaming_split"          # 保持流式，实时按换行分段
+
+# 需要跳过、不当回复内容发送的 chain 类型（思考过程 / 运行统计）
+_SKIP_CHAIN_TYPES = ("reasoning", "agent_stats")
+
 
 def split_text(text: str, mode: str = MODE_NEWLINE) -> List[str]:
     """把完整回复文本拆分成段落列表（纯函数，方便单测）。
@@ -75,8 +82,8 @@ def split_text(text: str, mode: str = MODE_NEWLINE) -> List[str]:
 @register(
     "astrbot_plugin_split_reply",
     "Zxin-Pro",
-    "非流式输出+换行分段发送插件（自动兼容流式配置）",
-    "1.1.0",
+    "非流式/流式双模式换行分段发送插件",
+    "1.2.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_split_reply",
 )
 class SplitReplyPlugin(Star):
@@ -109,37 +116,132 @@ class SplitReplyPlugin(Star):
         except (TypeError, ValueError):
             self.max_length = 0
 
-        # 强制非流式：流式输出（尤其默认的缓冲策略）会把多行内容合并成一条消息发出，
-        # 且内容在 on_llm_response 之前就已推送，插件无法拆分。
-        # AstrBot 支持事件级覆盖：internal agent stage 读取 event.get_extra("enable_streaming")，
-        # 非 None 时覆盖全局配置（internal.py:167），因此在消息事件入口统一置为 False。
-        self.force_non_streaming: bool = bool(
-            self.config.get("force_non_streaming", True)
+        # 流式策略：
+        # - force_non_streaming: 在消息入口把本条消息标记为非流式（internal.py:167
+        #   支持事件级 enable_streaming 覆盖），LLM 完整返回后在 on_llm_response 分段。
+        # - streaming_split: 保持流式输出，接管 event.send_streaming，
+        #   边接收流式增量边按换行实时分段发送（打字机效果保留，按行出消息）。
+        self.streaming_strategy: str = self.config.get(
+            "streaming_strategy", STRATEGY_NON_STREAMING
         )
+        if self.streaming_strategy not in (STRATEGY_NON_STREAMING, STRATEGY_STREAMING):
+            logger.warning(
+                f"[split_reply] 未知的 streaming_strategy '{self.streaming_strategy}'，"
+                f"回退为 {STRATEGY_NON_STREAMING}"
+            )
+            self.streaming_strategy = STRATEGY_NON_STREAMING
 
         logger.info(
             f"[split_reply] 已加载 split_mode={self.split_mode} "
             f"delay={self.delay_seconds}s max_length={self.max_length} "
-            f"force_non_streaming={self.force_non_streaming}"
+            f"streaming_strategy={self.streaming_strategy}"
         )
 
     # ------------------------------------------------------------------
-    # 流式兼容：在消息事件入口强制本条消息走非流式
+    # 消息入口：按策略处理流式
     # ------------------------------------------------------------------
     @filter.event_message_type(EventMessageType.ALL)
-    async def force_non_streaming_listener(self, event: AstrMessageEvent):
-        """对所有消息事件标记 enable_streaming=False。
-
-        internal agent stage 在开始处理时读取该 extra 决定是否流式
-        （internal.py: `if (enable_streaming := event.get_extra("enable_streaming"))
-        is not None: streaming_response = bool(enable_streaming)`），
-        置为 False 后本条消息走非流式分支，on_llm_response 钩子即可拿到完整文本分段。
-        """
+    async def on_message_entry(self, event: AstrMessageEvent):
+        """消息事件入口，在管线进入 LLM/Respond 阶段之前处理流式策略。"""
         try:
-            if self.force_non_streaming:
+            if self.streaming_strategy == STRATEGY_NON_STREAMING:
+                # 强制本条消息走非流式分支
                 event.set_extra("enable_streaming", False)
+            else:
+                # 保持流式，接管 send_streaming 实现按换行实时分段
+                self._patch_send_streaming(event)
         except Exception as e:
-            logger.warning(f"[split_reply] 设置非流式标记失败: {e}")
+            logger.warning(f"[split_reply] 消息入口处理失败: {e}")
+
+    # ------------------------------------------------------------------
+    # 流式分段核心
+    # ------------------------------------------------------------------
+    def _patch_send_streaming(self, event: AstrMessageEvent) -> None:
+        """把 event.send_streaming 替换为「按换行实时分段」实现。
+
+        只替换当前事件实例的绑定方法，不影响其他事件/插件。
+        原实现的 aiocqhttp fallback 只会按句号（。？！~…）切分或不切分，
+        均不满足按换行分段的需求，故完全接管发送逻辑。
+        """
+        if getattr(event, "_split_reply_patched", False):
+            return  # 防止同一事件被重复 patch
+        orig_send_streaming = getattr(event, "send_streaming", None)
+
+        async def patched_send_streaming(generator, use_fallback=False, *a, **k):
+            try:
+                await self._streaming_split_send(event, generator)
+            except Exception as e:
+                logger.error(f"[split_reply] 流式分段发送异常: {e}")
+            finally:
+                # 调用原实现收尾（空生成器），保留指标上报 / _has_send_oper 等副作用
+                if orig_send_streaming is not None:
+                    async def _empty():
+                        return
+                        yield  # pragma: no cover
+
+                    try:
+                        await orig_send_streaming(_empty(), use_fallback)
+                    except Exception:
+                        pass
+
+        event.send_streaming = patched_send_streaming
+        event._split_reply_patched = True
+
+    async def _streaming_split_send(self, event: AstrMessageEvent, generator) -> None:
+        """消费流式增量，按换行实时分段发送。
+
+        - 文本增量跨 chunk 累积，遇到换行立即把已完成的行作为独立消息发出
+        - 纯空白行不发送
+        - 思考过程(reasoning)/运行统计(agent_stats) 不发送
+        - 图片等非文本组件单独发送
+        """
+        state = {"sent": 0}  # 已发送条数，用于控制条间延迟
+        pending = ""
+
+        async for chain in generator:
+            chain_type = getattr(chain, "type", None)
+            if chain_type in _SKIP_CHAIN_TYPES:
+                continue
+
+            comps = list(getattr(chain, "chain", None) or [])
+            texts, others = [], []
+            for comp in comps:
+                if comp.__class__.__name__ == "Plain":
+                    texts.append(getattr(comp, "text", "") or "")
+                else:
+                    others.append(comp)
+
+            # 非文本组件：先清空已积压的文本再发送组件，保持顺序
+            if others:
+                if pending.strip():
+                    await self._send_segment(event, pending.strip(), state)
+                    pending = ""
+                for comp in others:
+                    await event.send(MessageChain(chain=[comp]))
+                    state["sent"] += 1
+
+            pending += "".join(texts)
+            pending = pending.replace("\r\n", "\n").replace("\r", "\n")
+
+            # 每遇到一个换行，就把该行作为独立消息发出
+            while "\n" in pending:
+                seg, pending = pending.split("\n", 1)
+                if seg.strip():
+                    await self._send_segment(event, seg.strip(), state)
+
+        # 收尾：发送最后一段（流结束时剩余内容）
+        if pending.strip():
+            await self._send_segment(event, pending.strip(), state)
+
+    async def _send_segment(self, event: AstrMessageEvent, seg: str, state: dict):
+        """发送单条分段消息，条与条之间加延迟。"""
+        seg = self._truncate(seg)
+        if not seg:
+            return
+        if state["sent"] > 0 and self.delay_seconds > 0:
+            await asyncio.sleep(self.delay_seconds)
+        await event.send(MessageChain().message(seg))
+        state["sent"] += 1
 
     # ------------------------------------------------------------------
     # 工具方法

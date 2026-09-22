@@ -1,6 +1,6 @@
 name: astrbot_plugin_split_reply
 desc: 把 LLM 回复按换行拆分成多条消息分段发送（非流式）。支持按换行/空行两种拆分模式，可配置发送间隔，自动过滤空行，防止重复发送。
-help: 无需指令，安装后自动生效。会强制本条消息走非流式以拿到完整回复（默认开启，可用 force_non_streaming 配置关闭）。
-version: v1.1.0
+help: 无需指令，安装后自动生效。streaming_strategy 可选 force_non_streaming（默认，稳定）或 streaming_split（保持流式打字机效果，按换行实时分段）。
+version: v1.2.0
 author: Zxin-Pro
 repo: https://github.com/Zxin-Pro/astrbot_plugin_split_reply

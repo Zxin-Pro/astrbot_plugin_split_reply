@@ -31,14 +31,16 @@ LLM 原始回复：
 
 本插件基于 `@filter.on_llm_response()` 钩子工作，该钩子在 LLM 完整返回后才触发。
 
-- **v1.1.0 起自动兼容流式输出**：插件默认（`force_non_streaming: true`）在消息事件入口把本条消息标记为非流式，多行内容不再被流式缓冲策略合并成一条，无需手动关闭 WebUI 的「流式回复」。
-- 如果把 `force_non_streaming` 关掉又开着流式回复，插件会检测到流式模式并自动跳过分段（避免重复发送），并在日志中给出提示。
+- **v1.2.0 起完整支持流式输出**：`streaming_strategy` 二选一：
+  - `force_non_streaming`（默认）：插件在消息入口把本条消息标记为非流式，多行内容不再被流式缓冲策略合并成一条，无需手动关闭 WebUI 的「流式回复」。
+  - `streaming_split`：保持流式打字机效果，插件接管 `send_streaming`，每写完一行就实时发出该行（空行过滤、条间延迟照常生效）。
+- 两种策略下插件都会检测当前是否处于流式路径并自动选择正确的分段方式，不会重复发送。
 
 ## 配置说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `force_non_streaming` | bool | `true` | 强制非流式：流式输出（尤其默认缓冲策略）会把多行内容合并成一条消息，且发出时机早于插件钩子。开启后插件在消息入口把本条消息标记为非流式（利用 AstrBot 事件级 `enable_streaming` 覆盖），保证分段生效，**无需去关 WebUI 的流式回复** |
+| `streaming_strategy` | string | `force_non_streaming` | 流式策略：`force_non_streaming` 强制本条消息走非流式，LLM 完整返回后分段（推荐，稳定）；`streaming_split` 保持流式打字机效果，按换行实时分段发送 |
 | `split_mode` | string | `newline` | 拆分模式：`newline` 按单个换行符拆分；`blank_line` 按空行拆分（`re.split(r'\n\s*\n', text)`），保留段内换行 |
 | `delay_seconds` | float | `0.5` | 每条分段消息之间的发送延迟（秒），防止触发平台风控 |
 | `max_length` | int | `0` | 单条消息最大长度（字符数），超过截断；`0` 不限制 |

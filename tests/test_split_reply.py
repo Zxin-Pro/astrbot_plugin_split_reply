@@ -63,7 +63,7 @@ class ResultContentType:
 
 class MessageChain:
     def __init__(self, *a, **k):
-        self.sent_chain = []
+        self.sent_chain = list(k.get("chain") or [])
 
     def message(self, text):
         self.sent_chain.append(text)
@@ -379,17 +379,26 @@ check("terminate 正常执行", True)
 # ------------------------------------------------------------------
 # 6. 强制非流式监听器测试
 # ------------------------------------------------------------------
-print("[6] force_non_streaming 监听器")
+print("[6] 流式策略监听器")
 
 plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
 ev = FakeEvent()
-run(plugin.force_non_streaming_listener(ev))
-check("默认开启时设置 enable_streaming=False", ev.get_extra("enable_streaming") is False)
+run(plugin.on_message_entry(ev))
+check(
+    "force_non_streaming 策略设置 enable_streaming=False",
+    ev.get_extra("enable_streaming") is False,
+)
+
+plugin = main.SplitReplyPlugin(main.Context(), {"streaming_strategy": "streaming_split"})
+ev = FakeEvent()
+run(plugin.on_message_entry(ev))
+check("streaming_split 策略接管 send_streaming", hasattr(ev, "_split_reply_patched"))
+check("streaming_split 不设置 enable_streaming", "enable_streaming" not in ev.extras)
 
 plugin = main.SplitReplyPlugin(main.Context(), {"force_non_streaming": False})
 ev = FakeEvent()
-run(plugin.force_non_streaming_listener(ev))
-check("关闭时不设置 extra", "enable_streaming" not in ev.extras)
+run(plugin.on_message_entry(ev))
+check("旧配置名忽略，仍走默认强制非流式", ev.get_extra("enable_streaming") is False)
 
 
 class BadEvent:
@@ -398,8 +407,110 @@ class BadEvent:
 
 
 plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
-run(plugin.force_non_streaming_listener(BadEvent()))
+run(plugin.on_message_entry(BadEvent()))
 check("set_extra 异常不崩溃", True)
+
+# ------------------------------------------------------------------
+# 7. 流式实时分段测试
+# ------------------------------------------------------------------
+print("[7] 流式实时分段")
+
+
+def run_streaming_split(chunks, config=None, skip_types=(), other_comps=None):
+    """模拟流式 chunk 序列，走 patched send_streaming，返回 event"""
+    plugin = main.SplitReplyPlugin(
+        main.Context(),
+        config if config is not None else {"streaming_strategy": "streaming_split"},
+    )
+    ev = FakeEvent()
+    ev.sent_chains = []
+
+    async def orig_send_streaming(gen, use_fallback=False):
+        async for c in gen:
+            ev.sent_chains.append(c)
+
+    ev.send_streaming = orig_send_streaming
+
+    async def gen():
+        for c in chunks:
+            yield c
+
+    run(plugin.on_message_entry(ev))
+    run(ev.send_streaming(gen()))
+    return ev
+
+
+class Plain:
+    def __init__(self, text):
+        self.text = text
+
+
+class FakeChain:
+    def __init__(self, text="", ctype=None, comps=None):
+        self.type = ctype
+        if comps is not None:
+            self.chain = comps
+        else:
+            self.chain = [Plain(text)] if text else []
+
+
+# 三行分布在三个 chunk（模拟 token 增量切分）
+ev = run_streaming_split([
+    FakeChain("刚在打游戏呢"),
+    FakeChain(" 没看手机\n你清理对话干嘛"),
+    FakeChain(" 我不是还在吗"),
+])
+check("跨 chunk 累积按换行实时分段", ev.sent == ["刚在打游戏呢 没看手机", "你清理对话干嘛 我不是还在吗"])
+
+# 空行被过滤
+ev = run_streaming_split([FakeChain("a\n\n   \nb")])
+check("流式模式过滤空行", ev.sent == ["a", "b"])
+
+# 结尾无换行的最后一段也要发出
+ev = run_streaming_split([FakeChain("x\ny")])
+check("结尾残留段发送", ev.sent == ["x", "y"])
+
+# reasoning / agent_stats 跳过
+ev = run_streaming_split([
+    FakeChain(ctype="reasoning", comps=[Plain("思考中")]),
+    FakeChain("正文", ctype="agent_stats"),
+    FakeChain("你好"),
+])
+check("思考过程和统计不发送", ev.sent == ["你好"])
+
+# 非文本组件单独发送
+class FakeImage:
+    pass
+
+
+ev = run_streaming_split([
+    FakeChain("看图\n", comps=[Plain("看图\n"), FakeImage()]),
+    FakeChain("说明"),
+])
+check("非文本组件单独发送", any(type(x).__name__ == "FakeImage" for x in ev.sent))
+strs = [x for x in ev.sent if isinstance(x, str)]
+check("文本正常分段", strs == ["看图", "说明"])
+check("组件先于其后的文本", ev.sent[0].__class__.__name__ == "FakeImage")
+
+# CRLF 兼容
+ev = run_streaming_split([FakeChain("a\r\nb")])
+check("流式模式 CRLF 兼容", ev.sent == ["a", "b"])
+
+# max_length 截断
+ev = run_streaming_split([FakeChain("12345678\n90")], config={"streaming_strategy": "streaming_split", "max_length": 5})
+check("流式模式 max_length 截断", ev.sent == ["12345", "90"])
+
+# 重复 patch 防护
+plugin = main.SplitReplyPlugin(main.Context(), {"streaming_strategy": "streaming_split"})
+ev = FakeEvent()
+run(plugin.on_message_entry(ev))
+first = ev.send_streaming
+run(plugin.on_message_entry(ev))
+check("同一事件不会重复 patch", ev.send_streaming is first)
+
+# patch 后仍调用原实现收尾（副作用保留）
+ev = run_streaming_split([FakeChain("a")])
+check("原 send_streaming 收尾被调用", len(ev.sent_chains) == 0)  # 空生成器无产出
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

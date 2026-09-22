@@ -1,9 +1,9 @@
 {
-  "force_non_streaming": {
-    "description": "强制非流式：开启流式输出时多行内容会被合并成一条消息，开启后插件强制本条消息走非流式以保证分段生效",
-    "type": "bool",
-    "hint": "保持开启即可，无需去关 WebUI 的流式回复",
-    "default": true
+  "streaming_strategy": {
+    "description": "流式策略：force_non_streaming=强制本条消息走非流式，完整返回后分段（推荐，稳定）；streaming_split=保持流式打字机效果，按换行实时分段发送",
+    "type": "string",
+    "hint": "force_non_streaming 或 streaming_split",
+    "default": "force_non_streaming"
   },
   "split_mode": {
     "description": "拆分模式：newline=按单个换行符拆分；blank_line=按空行拆分（保留段内换行）",
