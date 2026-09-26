@@ -5,6 +5,12 @@
     "hint": "force_non_streaming 或 streaming_split",
     "default": "force_non_streaming"
   },
+  "native_stream": {
+    "description": "原生流式分段：分段走平台自带的流式通道发送（QQ官方机器人私聊为逐字蹦出效果，一条消息逐帧刷新）",
+    "type": "string",
+    "hint": "auto=QQ官方自动开启 / on=所有平台都走原生流式 / off=只用普通发送",
+    "default": "auto"
+  },
   "split_mode": {
     "description": "拆分模式：newline=按单个换行符拆分；blank_line=按空行拆分（保留段内换行）",
     "type": "string",

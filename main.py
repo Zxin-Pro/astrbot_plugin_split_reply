@@ -82,8 +82,8 @@ def split_text(text: str, mode: str = MODE_NEWLINE) -> List[str]:
 @register(
     "astrbot_plugin_split_reply",
     "Zxin-Pro",
-    "非流式/流式双模式换行分段发送插件",
-    "1.2.0",
+    "非流式/流式/原生流式三模式换行分段发送插件",
+    "1.3.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_split_reply",
 )
 class SplitReplyPlugin(Star):
@@ -131,11 +131,38 @@ class SplitReplyPlugin(Star):
             )
             self.streaming_strategy = STRATEGY_NON_STREAMING
 
+        # 平台原生流式分段：
+        # auto = QQ 官方机器人自动启用（C2C 私聊原生流式，客户端逐字蹦出）；
+        # on = 所有平台都走原生流式通道；off = 只用普通发送。
+        self.native_stream: str = self.config.get("native_stream", "auto")
+        if self.native_stream not in ("auto", "on", "off"):
+            logger.warning(
+                f"[split_reply] 未知的 native_stream '{self.native_stream}'，回退为 auto"
+            )
+            self.native_stream = "auto"
+
         logger.info(
             f"[split_reply] 已加载 split_mode={self.split_mode} "
             f"delay={self.delay_seconds}s max_length={self.max_length} "
-            f"streaming_strategy={self.streaming_strategy}"
+            f"streaming_strategy={self.streaming_strategy} "
+            f"native_stream={self.native_stream}"
         )
+
+    def _should_use_native_stream(self, event: AstrMessageEvent) -> bool:
+        """判断分段是否走「平台原生流式」通道。
+
+        auto：QQ 官方机器人（qq_official / qq_official_webhook）自动开启，
+              其 C2C 流式协议是一条消息被逐帧刷新，客户端呈现逐字蹦出的效果。
+        """
+        if self.native_stream == "off":
+            return False
+        if self.native_stream == "on":
+            return True
+        try:
+            name = str(event.get_platform_name() or "")
+        except Exception:
+            name = ""
+        return "qq_official" in name
 
     # ------------------------------------------------------------------
     # 消息入口：按策略处理流式
@@ -168,13 +195,22 @@ class SplitReplyPlugin(Star):
         orig_send_streaming = getattr(event, "send_streaming", None)
 
         async def patched_send_streaming(generator, use_fallback=False, *a, **k):
+            use_native = self._should_use_native_stream(event)
             try:
-                await self._streaming_split_send(event, generator)
+                if use_native and orig_send_streaming is not None:
+                    # 走平台原生流式：每条分段各自开一条流式消息（QQ 官方逐字蹦出）
+                    await self._streaming_native_split_send(
+                        event, generator, orig_send_streaming
+                    )
+                else:
+                    await self._streaming_split_send(event, generator)
             except Exception as e:
                 logger.error(f"[split_reply] 流式分段发送异常: {e}")
             finally:
-                # 调用原实现收尾（空生成器），保留指标上报 / _has_send_oper 等副作用
-                if orig_send_streaming is not None:
+                # 普通模式下调用原实现收尾（空生成器），保留指标上报等副作用；
+                # 原生模式已逐段调用过原实现，无需再补空帧。
+                if not use_native and orig_send_streaming is not None:
+
                     async def _empty():
                         return
                         yield  # pragma: no cover
@@ -186,6 +222,105 @@ class SplitReplyPlugin(Star):
 
         event.send_streaming = patched_send_streaming
         event._split_reply_patched = True
+
+    async def _streaming_native_split_send(
+        self, event: AstrMessageEvent, generator, orig_send_streaming
+    ) -> None:
+        """把流式增量按换行切成若干「原生流式分段」，逐段交给平台自带的流式通道发送。
+
+        与 _streaming_split_send 的区别：普通模式用 event.send() 一次发一条；
+        本模式每段自己开一条平台流式消息（例如 QQ 官方 C2C 的 state=1 → state=10 分片
+        刷新），客户端呈现官方流式那种逐字蹦出的效果。
+
+        实现：一个 pump 协程持续消费上游增量并把「已完成的整行」放进各段的队列
+        （放完立即塞入结束哨兵 None），主流程按顺序对每段调用一次原 send_streaming，
+        因此每段都是独立的一条流式消息，且不需要等整轮 LLM 结束才收尾。
+        """
+        queues: list[asyncio.Queue] = []
+        state = {"sent": 0}
+        pending = ""
+
+        def new_queue_with(item) -> asyncio.Queue:
+            q: asyncio.Queue = asyncio.Queue()
+            q.put_nowait(item)
+            q.put_nowait(None)  # 该段内容已完整，立即结束这条流式消息
+            queues.append(q)
+            return q
+
+        async def emit_segment(seg: str) -> None:
+            seg = self._truncate(seg)
+            if seg:
+                new_queue_with(MessageChain().message(seg))
+
+        async def pump() -> None:
+            nonlocal pending
+            try:
+                async for chain in generator:
+                    chain_type = getattr(chain, "type", None)
+                    if chain_type in _SKIP_CHAIN_TYPES:
+                        continue
+                    if chain_type == "break":
+                        # 工具调用分隔信号：交给平台流式实现收尾当前段
+                        new_queue_with(chain)
+                        continue
+
+                    comps = list(getattr(chain, "chain", None) or [])
+                    texts, others = [], []
+                    for comp in comps:
+                        if comp.__class__.__name__ == "Plain":
+                            texts.append(getattr(comp, "text", "") or "")
+                        else:
+                            others.append(comp)
+                    if others:
+                        if pending.strip():
+                            await emit_segment(pending.strip())
+                            pending = ""
+                        new_queue_with(MessageChain(chain=list(others)))
+                    pending += "".join(texts)
+                    pending = pending.replace("\r\n", "\n").replace("\r", "\n")
+                    while "\n" in pending:
+                        seg, pending = pending.split("\n", 1)
+                        if seg.strip():
+                            await emit_segment(seg.strip())
+            finally:
+                if pending.strip():
+                    try:
+                        await emit_segment(pending.strip())
+                    except Exception as e:
+                        logger.error(f"[split_reply] 流式尾段发送失败: {e}")
+
+        pump_task = asyncio.create_task(pump())
+        idx = 0
+        try:
+            while True:
+                # 等待 pump 产出下一段队列
+                while idx >= len(queues) and not pump_task.done():
+                    await asyncio.sleep(0.02)
+                if idx >= len(queues):
+                    break
+                q = queues[idx]
+                idx += 1
+
+                async def queue_gen(q=q):
+                    while True:
+                        item = await q.get()
+                        if item is None:
+                            return
+                        yield item
+
+                if state["sent"] > 0 and self.delay_seconds > 0:
+                    await asyncio.sleep(self.delay_seconds)
+                try:
+                    await orig_send_streaming(queue_gen(), False)
+                    state["sent"] += 1
+                except Exception as e:
+                    logger.error(f"[split_reply] 原生流式分段发送失败: {e}")
+        finally:
+            if not pump_task.done():
+                try:
+                    await pump_task
+                except Exception as e:
+                    logger.error(f"[split_reply] 流式 pump 异常: {e}")
 
     async def _streaming_split_send(self, event: AstrMessageEvent, generator) -> None:
         """消费流式增量，按换行实时分段发送。

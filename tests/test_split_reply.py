@@ -512,5 +512,91 @@ check("同一事件不会重复 patch", ev.send_streaming is first)
 ev = run_streaming_split([FakeChain("a")])
 check("原 send_streaming 收尾被调用", len(ev.sent_chains) == 0)  # 空生成器无产出
 
+# ------------------------------------------------------------------
+# 8. 平台原生流式分段（QQ 官方机器人逐字蹦出）
+# ------------------------------------------------------------------
+print("[8] 原生流式分段")
+
+
+def run_native_split(chunks, config=None, platform="qq_official_webhook"):
+    """模拟原生流式模式：每段应各自调用一次原 send_streaming"""
+    cfg = {"streaming_strategy": "streaming_split"}
+    if config:
+        cfg.update(config)
+    plugin = main.SplitReplyPlugin(main.Context(), cfg)
+    ev = FakeEvent()
+    ev.get_platform_name = lambda: platform
+    ev.stream_calls = []  # 记录每次原生流式调用收到的内容
+
+    async def orig_send_streaming(gen, use_fallback=False):
+        got = []
+        async for chain in gen:
+            for c in getattr(chain, "sent_chain", []):
+                if isinstance(c, str):
+                    got.append(c)
+        ev.stream_calls.append(("".join(got), use_fallback))
+
+    ev.send_streaming = orig_send_streaming
+
+    async def gen():
+        for c in chunks:
+            yield c
+
+    run(plugin.on_message_entry(ev))
+    run(ev.send_streaming(gen()))
+    return ev
+
+
+ev = run_native_split([
+    FakeChain("刚在打游戏呢"),
+    FakeChain(" 没看手机\n你清理对话干嘛"),
+    FakeChain(" 我不是还在吗"),
+])
+check("每行各自开一条原生流式消息", [c[0] for c in ev.stream_calls] == ["刚在打游戏呢 没看手机", "你清理对话干嘛 我不是还在吗"])
+check("原生模式不使用普通 send", ev.sent == [])
+check("原生模式 use_fallback=False（走平台流式协议）", all(c[1] is False for c in ev.stream_calls))
+
+ev = run_native_split([FakeChain("a\n\n  \nb")])
+check("原生模式过滤空行", [c[0] for c in ev.stream_calls] == ["a", "b"])
+
+ev = run_native_split([FakeChain("x\ny")])
+check("原生模式结尾残留段补发", [c[0] for c in ev.stream_calls] == ["x", "y"])
+
+ev = run_native_split([FakeChain("12345678\n90")], config={"max_length": 5})
+check("原生模式 max_length 截断", [c[0] for c in ev.stream_calls] == ["12345", "90"])
+
+# 平台判定
+plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
+ev = FakeEvent()
+ev.get_platform_name = lambda: "qq_official_webhook"
+check("auto: QQ官方自动启用原生流式", plugin._should_use_native_stream(ev) is True)
+ev.get_platform_name = lambda: "aiocqhttp"
+check("auto: 其他平台不用原生流式", plugin._should_use_native_stream(ev) is False)
+plugin = main.SplitReplyPlugin(main.Context(), {"native_stream": "on"})
+check("on: 强制原生流式", plugin._should_use_native_stream(ev) is True)
+plugin = main.SplitReplyPlugin(main.Context(), {"native_stream": "off"})
+ev.get_platform_name = lambda: "qq_official_webhook"
+check("off: 关闭原生流式", plugin._should_use_native_stream(ev) is False)
+plugin = main.SplitReplyPlugin(main.Context(), {"native_stream": "bad"})
+check("非法 native_stream 回退 auto", plugin.native_stream == "auto")
+
+
+class BadPlatformEvent(FakeEvent):
+    def get_platform_name(self):
+        raise RuntimeError("boom")
+
+
+plugin = main.SplitReplyPlugin(main.Context(), FakeConfig())
+check("平台名获取异常不崩溃", plugin._should_use_native_stream(BadPlatformEvent()) is False)
+
+# aiocqhttp 平台默认仍走普通发送
+ev = run_native_split([FakeChain("a\nb")], platform="aiocqhttp")
+
+check("非QQ官方平台走普通分段发送", ev.sent == ["a", "b"])
+check(
+    "非QQ官方平台不经原生流式通道",
+    all(c[0] == "" for c in ev.stream_calls),  # 仅收尾空调用，无内容走原生流式
+)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
